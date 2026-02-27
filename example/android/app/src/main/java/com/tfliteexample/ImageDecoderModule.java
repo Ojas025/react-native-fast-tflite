@@ -3,8 +3,6 @@ package com.tfliteexample;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Matrix;
-import android.util.Base64;
-
 import androidx.annotation.NonNull;
 import androidx.exifinterface.media.ExifInterface;
 
@@ -14,6 +12,7 @@ import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.modules.blob.BlobModule;
 
 import java.io.IOException;
 
@@ -80,12 +79,22 @@ public class ImageDecoderModule extends ReactContextBaseJavaModule {
         rgb[j++] = (byte) (pixel & 0xFF);         // B
       }
 
-      String rgbBase64 = Base64.encodeToString(rgb, Base64.NO_WRAP);
+      BlobModule blobModule = getReactApplicationContext().getNativeModule(BlobModule.class);
+      if (blobModule == null) {
+        throw new IOException("BlobModule is unavailable.");
+      }
+      String blobId = blobModule.store(rgb);
+
+      WritableMap rgbBlob = Arguments.createMap();
+      rgbBlob.putString("blobId", blobId);
+      rgbBlob.putInt("offset", 0);
+      rgbBlob.putInt("size", rgb.length);
+      rgbBlob.putString("type", "application/octet-stream");
 
       WritableMap result = Arguments.createMap();
       result.putInt("width", width);
       result.putInt("height", height);
-      result.putString("rgbBase64", rgbBase64);
+      result.putMap("rgbBlob", rgbBlob);
       promise.resolve(result);
     } catch (Exception e) {
       promise.reject("decode_error", e.getMessage(), e);
