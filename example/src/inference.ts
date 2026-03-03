@@ -70,6 +70,17 @@ interface DecodedText {
   confidence: number
 }
 
+const EMPTY_STRINGS: string[] = []
+
+let detTensorCache: Float32Array | null = null
+let detTensorCacheSize = 0
+
+let recTensorCache: Float32Array | null = null
+let recTensorCacheSize = 0
+
+let recResizeCache: Uint8Array | null = null
+let recResizeCacheSize = 0
+
 function nowMs(): number {
   if (globalThis.performance?.now != null) {
     return globalThis.performance.now()
@@ -243,6 +254,18 @@ function resizeBilinearRgb(
   }
 
   const dst = new Uint8Array(dstW * dstH * 3)
+  resizeBilinearRgbInto(src, srcW, srcH, dstW, dstH, dst)
+  return dst
+}
+
+function resizeBilinearRgbInto(
+  src: Uint8Array,
+  srcW: number,
+  srcH: number,
+  dstW: number,
+  dstH: number,
+  dst: Uint8Array
+): void {
   const xScale = srcW / dstW
   const yScale = srcH / dstH
 
@@ -278,8 +301,6 @@ function resizeBilinearRgb(
       }
     }
   }
-
-  return dst
 }
 
 function preprocessDetection(
@@ -295,64 +316,32 @@ function preprocessDetection(
   const padW = Math.floor((inputSize - newW) / 2)
   const padH = Math.floor((inputSize - newH) / 2)
 
-  const tensor = new Float32Array(inputSize * inputSize * 3)
+  const tensorSize = inputSize * inputSize * 3
+  if (detTensorCache == null || detTensorCacheSize !== tensorSize) {
+    detTensorCache = new Float32Array(tensorSize)
+    detTensorCacheSize = tensorSize
+  }
+  const tensor = detTensorCache
   const padValue = 114 / 255
   tensor.fill(padValue)
-
-  const xScale = origW / newW
-  const yScale = origH / newH
-
-  const x0 = new Int32Array(newW)
-  const x1 = new Int32Array(newW)
-  const wx = new Float32Array(newW)
-
-  for (let dx = 0; dx < newW; dx += 1) {
-    const fx = (dx + 0.5) * xScale - 0.5
-    const ix0 = clamp(Math.floor(fx), 0, origW - 1)
-    const ix1 = clamp(ix0 + 1, 0, origW - 1)
-    x0[dx] = ix0
-    x1[dx] = ix1
-    wx[dx] = fx - ix0
-  }
 
   const inv255 = 1 / 255
 
   for (let dy = 0; dy < newH; dy += 1) {
-    const fy = (dy + 0.5) * yScale - 0.5
-    const iy0 = clamp(Math.floor(fy), 0, origH - 1)
-    const iy1 = clamp(iy0 + 1, 0, origH - 1)
-    const wy = fy - iy0
+    const srcY = ((dy * origH) / newH) | 0
 
     const dstY = dy + padH
     const dstRow = dstY * inputSize * 3
-
-    const row0 = iy0 * origW * 3
-    const row1 = iy1 * origW * 3
+    const srcRow = srcY * origW * 3
 
     for (let dx = 0; dx < newW; dx += 1) {
-      const ix0 = x0[dx]
-      const ix1 = x1[dx]
-      const wxv = wx[dx]
-
-      const topLeft = row0 + ix0 * 3
-      const topRight = row0 + ix1 * 3
-      const botLeft = row1 + ix0 * 3
-      const botRight = row1 + ix1 * 3
+      const srcX = ((dx * origW) / newW) | 0
+      const srcIdx = srcRow + srcX * 3
 
       const dstIdx = dstRow + (dx + padW) * 3
-
-      for (let c = 0; c < 3; c += 1) {
-        const v00 = data[topLeft + c]
-        const v01 = data[topRight + c]
-        const v10 = data[botLeft + c]
-        const v11 = data[botRight + c]
-
-        const top = v00 + (v01 - v00) * wxv
-        const bottom = v10 + (v11 - v10) * wxv
-        const value = top + (bottom - top) * wy
-
-        tensor[dstIdx + c] = value * inv255
-      }
+      tensor[dstIdx] = data[srcIdx] * inv255
+      tensor[dstIdx + 1] = data[srcIdx + 1] * inv255
+      tensor[dstIdx + 2] = data[srcIdx + 2] * inv255
     }
   }
 
@@ -416,30 +405,48 @@ function postprocessDetection(
   rawOutput: Float32Array,
   outputShape: number[],
   image: RgbImage,
-  confThresh: number
+  confThresh: number,
+  inputSize: number,
+  scale: number,
+  padW: number,
+  padH: number
 ): DetectionBox[] {
-  const rows = outputShape[1] // 300
-  const results: DetectionBox[] = []
+  // New format: [1, 3549, 5] — raw anchors (x1, y1, x2, y2, conf), normalized to inputSize
+  // Old format: [1, 300, 6] — post-NMS boxes from in-model postprocess head
+  const isRawAnchors = outputShape[1] !== 300
+
+  const rows = outputShape[1]
+  const stride = isRawAnchors ? 5 : 6
+  const rawBoxes: number[][] = []
+  const rawScores: number[] = []
 
   for (let i = 0; i < rows; i++) {
-    const offset = i * 6
-
-    const xmin = rawOutput[offset + 0]
-    const ymin = rawOutput[offset + 1]
-    const xmax = rawOutput[offset + 2]
-    const ymax = rawOutput[offset + 3]
+    const offset = i * stride
     const score = rawOutput[offset + 4]
 
     if (score < confThresh) continue
 
-    // Convert normalized → original image size
-    const rawX1 = Math.round(xmin * image.width)
-    const rawY1 = Math.round(ymin * image.height)
-    const rawX2 = Math.round(xmax * image.width)
-    const rawY2 = Math.round(ymax * image.height)
+    const x1_416 = rawOutput[offset + 0] * inputSize
+    const y1_416 = rawOutput[offset + 1] * inputSize
+    const x2_416 = rawOutput[offset + 2] * inputSize
+    const y2_416 = rawOutput[offset + 3] * inputSize
+
+    const rawX1 = clamp(Math.round((x1_416 - padW) / scale), 0, image.width)
+    const rawY1 = clamp(Math.round((y1_416 - padH) / scale), 0, image.height)
+    const rawX2 = clamp(Math.round((x2_416 - padW) / scale), 0, image.width)
+    const rawY2 = clamp(Math.round((y2_416 - padH) / scale), 0, image.height)
 
     if (rawX2 <= rawX1 || rawY2 <= rawY1) continue
 
+    rawBoxes.push([rawX1, rawY1, rawX2, rawY2])
+    rawScores.push(score)
+  }
+
+  const keepIndices = isRawAnchors ? nms(rawBoxes, rawScores, 0.5) : rawBoxes.map((_, idx) => idx)
+  const results: DetectionBox[] = []
+
+  for (const idx of keepIndices) {
+    const [rawX1, rawY1, rawX2, rawY2] = rawBoxes[idx]
     const boxW = rawX2 - rawX1
     const boxH = rawY2 - rawY1
     const padLeft = Math.max(2, Math.round(boxW * DETECTION_PAD_LEFT_RATIO))
@@ -454,13 +461,7 @@ function postprocessDetection(
 
     if (x2 <= x1 || y2 <= y1) continue
 
-    results.push({
-      x1,
-      y1,
-      x2,
-      y2,
-      conf: score,
-    })
+    results.push({ x1, y1, x2, y2, conf: rawScores[idx] })
   }
 
   return results
@@ -497,15 +498,20 @@ function preprocessRecognition(
   const ratio = targetH / crop.height
   const newW = Math.max(1, Math.min(Math.floor(crop.width * ratio), targetW))
 
-  const resized = resizeBilinearRgb(
-    crop.data,
-    crop.width,
-    crop.height,
-    newW,
-    targetH
-  )
+  const resizedSize = targetH * newW * 3
+  if (recResizeCache == null || recResizeCacheSize !== resizedSize) {
+    recResizeCache = new Uint8Array(resizedSize)
+    recResizeCacheSize = resizedSize
+  }
+  const resized = recResizeCache
+  resizeBilinearRgbInto(crop.data, crop.width, crop.height, newW, targetH, resized)
 
-  const tensor = new Float32Array(targetH * targetW * 3)
+  const tensorSize = targetH * targetW * 3
+  if (recTensorCache == null || recTensorCacheSize !== tensorSize) {
+    recTensorCache = new Float32Array(tensorSize)
+    recTensorCacheSize = tensorSize
+  }
+  const tensor = recTensorCache
   tensor.fill(-1)
 
   for (let y = 0; y < targetH; y += 1) {
@@ -676,8 +682,10 @@ export async function runInference(
   confThresh = 0.25,
   iouThresh = 0.7,
   maxCrops = Number.POSITIVE_INFINITY,
-  includeDebugImages = false
+  includeDebugImages = false,
+  detTensor?: Float32Array
 ): Promise<InferenceResult> {
+  const debugEnabled = includeDebugImages === true
   const startedAt = nowMs()
 
   if (detModel.inputs.length === 0 || detModel.outputs.length === 0) {
@@ -708,9 +716,11 @@ export async function runInference(
   const recTargetW = recInputShape[2]
 
   const detPreprocessStartedAt = nowMs()
-  const detPrep = preprocessDetection(image, detInputSize)
+  const detPrep = detTensor != null
+    ? { tensor: detTensor, scale: Math.min(detInputSize / image.width, detInputSize / image.height), padW: Math.floor((detInputSize - Math.max(1, Math.floor(image.width * Math.min(detInputSize / image.width, detInputSize / image.height)))) / 2), padH: Math.floor((detInputSize - Math.max(1, Math.floor(image.height * Math.min(detInputSize / image.width, detInputSize / image.height)))) / 2) }
+    : preprocessDetection(image, detInputSize)
   const detectionPreprocessMs = nowMs() - detPreprocessStartedAt
-  const detectionInputBase64 = includeDebugImages
+  const detectionInputBase64 = debugEnabled
     ? encodePngBase64Rgb(
         tensorToRgbBytes(detPrep.tensor, detInputSize, detInputSize, 'zeroOne'),
         detInputSize,
@@ -728,24 +738,24 @@ export async function runInference(
 
   const detRaw = toFloat32Array(detOutputs[0])
 
-  console.log('DET OUTPUT SHAPE:', detOutputShape)
-  console.log('RAW LENGTH:', detRaw.length)
-  console.log('FIRST 20 VALUES:', Array.from(detRaw.slice(0, 20)))
-
   const detPostprocessStartedAt = nowMs()
-const boxes = postprocessDetection(
-  detRaw,
-  detOutputShape,
-  image,
-  confThresh
-)
+  const boxes = postprocessDetection(
+    detRaw,
+    detOutputShape,
+    image,
+    confThresh,
+    detInputSize,
+    detPrep.scale,
+    detPrep.padW,
+    detPrep.padH
+  )
   const detectionPostprocessMs = nowMs() - detPostprocessStartedAt
   const detectionTotalMs =
     detectionPreprocessMs + detectionInferenceMs + detectionPostprocessMs
   const firstDetectionCrop =
-    includeDebugImages && boxes.length > 0 ? cropRgb(image, boxes[0]) : null
+    debugEnabled && boxes.length > 0 ? cropRgb(image, boxes[0]) : null
   const detectionCrop320Base64 =
-    includeDebugImages && firstDetectionCrop != null
+    debugEnabled && firstDetectionCrop != null
       ? encodePngBase64Rgb(
           resizeBilinearRgb(
             firstDetectionCrop.data,
@@ -760,19 +770,29 @@ const boxes = postprocessDetection(
       : null
 
   const texts: RecognitionEntry[] = []
-  const boxesForRecognition =
-    boxes.length > maxCrops
-      ? boxes
-          .slice()
-          .sort((a, b) => b.conf - a.conf)
-          .slice(0, maxCrops)
-      : boxes
+  let boxesForRecognition: DetectionBox[] = boxes
+  if (Number.isFinite(maxCrops) && boxes.length > maxCrops) {
+    if (maxCrops === 1) {
+      let best = boxes[0]
+      for (let i = 1; i < boxes.length; i += 1) {
+        if (boxes[i].conf > best.conf) {
+          best = boxes[i]
+        }
+      }
+      boxesForRecognition = [best]
+    } else {
+      boxesForRecognition = boxes
+        .slice()
+        .sort((a, b) => b.conf - a.conf)
+        .slice(0, maxCrops)
+    }
+  }
   let recognitionCropMs = 0
   let recognitionPreprocessMs = 0
   let recognitionInferenceMs = 0
   let recognitionDecodeMs = 0
   let cropsProcessed = 0
-  const recognitionInputsBase64: string[] = []
+  const recognitionInputsBase64: string[] = debugEnabled ? [] : EMPTY_STRINGS
   let bestRecConf = 0
   const recognitionLoopStartedAt = nowMs()
 
@@ -784,7 +804,7 @@ const boxes = postprocessDetection(
       continue
     }
     cropsProcessed += 1
-    if (includeDebugImages) {
+    if (debugEnabled && recognitionInputsBase64 !== EMPTY_STRINGS) {
       recognitionInputsBase64.push(
         encodePngBase64Rgb(crop.data, crop.width, crop.height)
       )

@@ -23,7 +23,12 @@ interface NativeImageDecoderSpec {
   decodeImage(
     path: string,
     maxDimension: number
-  ): Promise<NativeDecodedImagePayload>
+  ): Promise<NativeDecodedImagePayload>,
+  decodeImageAsDetectionTensor(
+    path: string,
+    inputSize: number,
+    padValue: number
+  ): Promise<NativeBlobPayload>
 }
 
 const NativeImageDecoder = NativeModules.ImageDecoder as
@@ -41,24 +46,18 @@ const BlobManager = require(
  * Fast native blob -> ArrayBuffer transfer.
  * Uses RN FileReader polyfill (required for current RN versions).
  */
-function blobToArrayBuffer(
-  options: NativeBlobPayload
-): Promise<ArrayBuffer> {
-  return new Promise((resolve, reject) => {
+function readBlobAsArrayBuffer(options: NativeBlobPayload): Promise<ArrayBuffer> {
+  return new Promise<ArrayBuffer>((resolve, reject) => {
     const blob = BlobManager.createFromOptions(options)
     const reader = new FileReader()
-
     reader.onload = () => {
-      const result = reader.result as ArrayBuffer
+      resolve(reader.result as ArrayBuffer)
       blob.close()
-      resolve(result)
     }
-
     reader.onerror = () => {
       blob.close()
-      reject(new Error('Failed to read native RGB blob.'))
+      reject(new Error('Failed to read blob.'))
     }
-
     reader.readAsArrayBuffer(blob)
   })
 }
@@ -86,11 +85,28 @@ export async function decodeImageToArrayBuffer(
     )
   }
 
-  const buffer = await blobToArrayBuffer(decoded.rgbBlob)
+  const buffer = await readBlobAsArrayBuffer(decoded.rgbBlob)
 
   return {
     width: decoded.width,
     height: decoded.height,
     rgbBytes: buffer,
   }
+}
+
+export async function decodeImageAsDetectionTensor(
+  path: string,
+  inputSize: number,
+  padValue: number = 114 / 255
+): Promise<Float32Array> {
+  if (NativeImageDecoder == null) {
+    throw new Error('Native ImageDecoder module is unavailable.')
+  }
+  const blob = await NativeImageDecoder.decodeImageAsDetectionTensor(
+    path,
+    inputSize,
+    padValue
+  )
+  const buffer = await readBlobAsArrayBuffer(blob)
+  return new Float32Array(buffer)
 }

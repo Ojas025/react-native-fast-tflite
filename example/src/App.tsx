@@ -16,6 +16,7 @@ import {
   Camera,
   PhotoFile,
   useCameraDevice,
+  useCameraFormat,
   useCameraPermission,
 } from 'react-native-vision-camera'
 
@@ -67,9 +68,8 @@ function formatMs(value: number | null | undefined): string {
   return `${value.toFixed(1)} ms`
 }
 
-const MAX_RECOGNITION_CROPS = 6
-const MIN_DECODE_DIMENSION = 480
-const SHOW_DEBUG_IMAGES = true
+const MAX_RECOGNITION_CROPS = 2
+const SHOW_DEBUG_IMAGES: boolean = false
 
 export default function App(): React.ReactNode {
   const cameraRef = React.useRef<Camera>(null)
@@ -77,25 +77,62 @@ export default function App(): React.ReactNode {
 
   const { hasPermission, requestPermission } = useCameraPermission()
   const device = useCameraDevice('back')
-
-  const detPlugin = useTensorflowModel(require('../assets/best_float16.tflite'))
-  const recPlugin = useTensorflowModel(require('../assets/rec_model.tflite'))
-
+  const preferredFormat = useCameraFormat(device, [
+    { photoResolution: { width: 1280, height: 720 } },
+    { fps: 30 },
+  ])
+  const fallbackFormat = useCameraFormat(device, [
+    { photoResolution: { width: 640, height: 480 } },
+    { fps: 30 },
+  ])
+  const detPlugin = useTensorflowModel(
+    require('../assets/yolov26n_no_nms_float16.tflite'),
+    'android-gpu'
+  )
+  const recPlugin = useTensorflowModel(
+    require('../assets/rec_model.tflite'),
+    'android-gpu'
+  )
   const detModel = detPlugin.state === 'loaded' ? detPlugin.model : undefined
   const recModel = recPlugin.state === 'loaded' ? recPlugin.model : undefined
 
-  const [capturedPhoto, setCapturedPhoto] = React.useState<PhotoFile | null>(null)
+  // React.useEffect(() => {
+  //   if (detModel !== undefined && recModel !== undefined) {
+  //     console.log('DET input dtype:', detModel.inputs?.[0]?.dataType)
+  //     console.log('DET output dtype:', detModel.outputs?.[0]?.dataType)
+  //     console.log('REC input dtype:', recModel.inputs?.[0]?.dataType)
+  //     console.log('REC output dtype:', recModel.outputs?.[0]?.dataType)
+  //   }
+  // }, [detModel, recModel])
+
+  // React.useEffect(() => {
+  //   if (detModel != null && recModel != null) {
+  //     const dummy = new Float32Array(1 * 416 * 416 * 3).fill(0)
+  //     detModel.run([dummy]).catch(() => {})
+  //   }
+  // }, [detModel, recModel])
+
+  // React.useEffect(() => {
+  //   if (detModel != null) {
+  //     console.log('DET output shape:', JSON.stringify(detModel.outputs))
+  //   }
+  // }, [detModel])
+
+  const [capturedPhoto, setCapturedPhoto] = React.useState<PhotoFile | null>(
+    null
+  )
   const [isDetecting, setIsDetecting] = React.useState(false)
+  const [useCameraFallback, setUseCameraFallback] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [result, setResult] = React.useState<InferenceResult | null>(null)
-  const [detectLatency, setDetectLatency] = React.useState<DetectLatencyBreakdown | null>(null)
+  const [detectLatency, setDetectLatency] =
+    React.useState<DetectLatencyBreakdown | null>(null)
 
   React.useEffect(() => {
     requestPermission()
   }, [requestPermission])
-
   const modelsReady = detModel != null && recModel != null
-
+  const debugImagesEnabled = SHOW_DEBUG_IMAGES === true
   const modelError =
     detPlugin.state === 'error'
       ? `Detection model: ${detPlugin.error.message}`
@@ -154,32 +191,26 @@ export default function App(): React.ReactNode {
       setDetectLatency(null)
       await yieldToUi(runId, detectRunIdRef)
 
-      const detInputShape = detModel.inputs[0]?.shape ?? []
-      const detInputSize = typeof detInputShape[1] === 'number' ? detInputShape[1] : 640
-      const maxDecodeDimension = Math.max(
-        MIN_DECODE_DIMENSION,
-        Math.min(detInputSize * 2, 1280)
-      )
+      const inputSize = 416
 
       const decodeStartedAt = nowMs()
-      const decoded = await decodeImageToArrayBuffer(capturedPhoto.path, maxDecodeDimension)
+      const decoded = await decodeImageToArrayBuffer(
+        capturedPhoto.path,
+        inputSize
+      )
       if (runId !== detectRunIdRef.current) {
         return
       }
       const decodeImageMs = nowMs() - decodeStartedAt
+      const byteArrayMs = 0
+      const imageBuildMs = 0
 
-      await yieldToUi(runId, detectRunIdRef)
-      const byteArrayStartedAt = nowMs()
       const decodedBytes = new Uint8Array(decoded.rgbBytes)
-      const byteArrayMs = nowMs() - byteArrayStartedAt
-
-      const imageBuildStartedAt = nowMs()
       const image: RgbImage = {
         width: decoded.width,
         height: decoded.height,
         data: decodedBytes,
       }
-      const imageBuildMs = nowMs() - imageBuildStartedAt
 
       const inferenceStartedAt = nowMs()
       const inference = await runInference(
@@ -190,7 +221,7 @@ export default function App(): React.ReactNode {
         0.25,
         0.5,
         MAX_RECOGNITION_CROPS,
-        SHOW_DEBUG_IMAGES
+        debugImagesEnabled
       )
       if (runId !== detectRunIdRef.current) {
         return
@@ -236,7 +267,6 @@ export default function App(): React.ReactNode {
     ensureActive(runId, runRef)
   }
 
-
   if (!hasPermission) {
     return (
       <SafeAreaView style={styles.root}>
@@ -260,7 +290,8 @@ export default function App(): React.ReactNode {
     )
   }
 
-  const photoUri = capturedPhoto != null ? toFileUri(capturedPhoto.path) : undefined
+  const photoUri =
+    capturedPhoto != null ? toFileUri(capturedPhoto.path) : undefined
   const parsedWeight =
     result?.value != null
       ? `${result.value}${result.unit != null && result.unit.length > 0 ? ` ${result.unit}` : ''}`
@@ -271,17 +302,37 @@ export default function App(): React.ReactNode {
       <View style={styles.previewCard}>
         {capturedPhoto == null ? (
           <Camera
+            key={useCameraFallback ? 'camera-fallback' : 'camera-default'}
             ref={cameraRef}
             style={StyleSheet.absoluteFill}
-            isActive={true}
             device={device}
+            format={useCameraFallback ? fallbackFormat : preferredFormat}
+            isActive={true}
             photo={true}
-            onError={(cameraError) => {
-              setError(`Camera error: ${cameraError.message}`)
+            onError={(e) => {
+              const msg = e.message ?? ''
+              const low = msg.toLowerCase()
+              const isInvalidOutputConfig =
+                low.includes('invalid-output-configuration') ||
+                low.includes('output/stream configurations are invalid')
+
+              if (isInvalidOutputConfig && !useCameraFallback) {
+                setUseCameraFallback(true)
+                setError(
+                  'Switched to safe camera format due to stream config error.'
+                )
+                return
+              }
+
+              setError(`Camera error: ${msg}`)
             }}
           />
         ) : (
-          <Image source={{ uri: photoUri }} style={StyleSheet.absoluteFill} resizeMode="contain" />
+          <Image
+            source={{ uri: photoUri }}
+            style={StyleSheet.absoluteFill}
+            resizeMode="contain"
+          />
         )}
 
         {isDetecting && (
@@ -341,7 +392,9 @@ export default function App(): React.ReactNode {
           Recognition model: {modelStateToMessage(recPlugin.state)}
         </Text>
 
-        {modelError != null && <Text style={styles.errorText}>{modelError}</Text>}
+        {modelError != null && (
+          <Text style={styles.errorText}>{modelError}</Text>
+        )}
         {error != null && <Text style={styles.errorText}>{error}</Text>}
 
         {capturedPhoto != null && (
@@ -355,16 +408,20 @@ export default function App(): React.ReactNode {
             <Text style={styles.resultTitle}>Detected Weight</Text>
             <Text style={styles.resultWeight}>{parsedWeight}</Text>
             <Text style={styles.resultLine}>Raw OCR: {result.combined}</Text>
-            <Text style={styles.resultLine}>Detected boxes: {result.boxes.length}</Text>
+            <Text style={styles.resultLine}>
+              Detected boxes: {result.boxes.length}
+            </Text>
             <Text style={styles.resultLine}>
               OCR confidence: {result.recConf.toFixed(3)}
             </Text>
-            {SHOW_DEBUG_IMAGES && (
+            {debugImagesEnabled && (
               <>
                 <Text style={styles.resultSectionTitle}>Model Inputs</Text>
                 <View style={styles.modelInputRow}>
                   <View style={styles.modelInputCard}>
-                    <Text style={styles.modelInputLabel}>Detection (320x320)</Text>
+                    <Text style={styles.modelInputLabel}>
+                      Detection (320x320)
+                    </Text>
                     {result.detectionInputBase64 != null ? (
                       <Image
                         source={{
@@ -373,11 +430,15 @@ export default function App(): React.ReactNode {
                         style={styles.modelInputImage}
                       />
                     ) : (
-                      <Text style={styles.modelInputEmpty}>No detection input</Text>
+                      <Text style={styles.modelInputEmpty}>
+                        No detection input
+                      </Text>
                     )}
                   </View>
                   <View style={styles.modelInputCard}>
-                    <Text style={styles.modelInputLabel}>Recognition crop (first)</Text>
+                    <Text style={styles.modelInputLabel}>
+                      Recognition crop (first)
+                    </Text>
                     {result.recognitionInputsBase64.length > 0 ? (
                       <Image
                         source={{
@@ -392,7 +453,9 @@ export default function App(): React.ReactNode {
                   </View>
                 </View>
                 <View style={styles.modelInputRow}>
-                  <View style={[styles.modelInputCard, styles.modelInputCardWide]}>
+                  <View
+                    style={[styles.modelInputCard, styles.modelInputCardWide]}
+                  >
                     <Text style={styles.modelInputLabel}>
                       Detection crop (first box, 320x320)
                     </Text>
@@ -405,7 +468,9 @@ export default function App(): React.ReactNode {
                         resizeMode="contain"
                       />
                     ) : (
-                      <Text style={styles.modelInputEmpty}>No detection crop</Text>
+                      <Text style={styles.modelInputEmpty}>
+                        No detection crop
+                      </Text>
                     )}
                   </View>
                 </View>
@@ -437,35 +502,45 @@ export default function App(): React.ReactNode {
               Detection total: {formatMs(result.latency.detectionTotalMs)}
             </Text>
             <Text style={styles.resultLine}>
-              Detection preprocess: {formatMs(result.latency.detectionPreprocessMs)}
+              Detection preprocess:{' '}
+              {formatMs(result.latency.detectionPreprocessMs)}
             </Text>
             <Text style={styles.resultLine}>
-              Detection inference: {formatMs(result.latency.detectionInferenceMs)}
+              Detection inference:{' '}
+              {formatMs(result.latency.detectionInferenceMs)}
             </Text>
             <Text style={styles.resultLine}>
-              Detection postprocess: {formatMs(result.latency.detectionPostprocessMs)}
+              Detection postprocess:{' '}
+              {formatMs(result.latency.detectionPostprocessMs)}
             </Text>
             <Text style={styles.resultLine}>
-              Recognition total loop: {formatMs(result.latency.recognitionTotalMs)}
+              Recognition total loop:{' '}
+              {formatMs(result.latency.recognitionTotalMs)}
             </Text>
             <Text style={styles.resultLine}>
               Recognition crop: {formatMs(result.latency.recognitionCropMs)}
             </Text>
             <Text style={styles.resultLine}>
-              Recognition preprocess: {formatMs(result.latency.recognitionPreprocessMs)}
+              Recognition preprocess:{' '}
+              {formatMs(result.latency.recognitionPreprocessMs)}
             </Text>
             <Text style={styles.resultLine}>
-              Recognition inference: {formatMs(result.latency.recognitionInferenceMs)}
+              Recognition inference:{' '}
+              {formatMs(result.latency.recognitionInferenceMs)}
             </Text>
             <Text style={styles.resultLine}>
               Recognition decode: {formatMs(result.latency.recognitionDecodeMs)}
             </Text>
             <Text style={styles.resultLine}>
-              Recognition other/overhead: {formatMs(result.latency.recognitionOtherMs)}
+              Recognition other/overhead:{' '}
+              {formatMs(result.latency.recognitionOtherMs)}
             </Text>
-            <Text style={styles.resultLine}>Parse weight: {formatMs(result.latency.parseMs)}</Text>
             <Text style={styles.resultLine}>
-              Crops processed: {result.latency.cropsProcessed}/{result.latency.boxesDetected}
+              Parse weight: {formatMs(result.latency.parseMs)}
+            </Text>
+            <Text style={styles.resultLine}>
+              Crops processed: {result.latency.cropsProcessed}/
+              {result.latency.boxesDetected}
             </Text>
             <Text style={styles.resultLine}>
               Legacy total latency: {result.timeMs.toFixed(1)} ms
